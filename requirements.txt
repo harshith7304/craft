@@ -1,0 +1,9 @@
+# CRAFT Text Detection MVP
+# Install these dependencies first
+
+craft-text-detector==0.4.3
+opencv-python>=4.5.0
+numpy>=1.19.0
+Pillow>=8.0.0
+torch>=1.7.0
+torchvision>=0.8.0
