@@ -35,11 +35,19 @@ ENV/
 *.swp
 *.swo
 
-# Results (optional - uncomment if you want to track)
-# *_detected.png
-# detection_result.json
-# result_*.json
-# all_results.json
+# Results
+*_detected.png
+detection_result.json
+result_*.json
+all_results.json
+outputs/
+outputs_*/
+results/
+results*/
+image/*_detected.png
+image/*_detected.jpg
+image/*_detected.jpeg
+crops/
 
 # OS
 .DS_Store

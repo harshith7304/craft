@@ -1,6 +1,6 @@
 """
-CRAFT Text Detection MVP
-========================
+CRAFT Text Detection MVP - Using Official CRAFT-pytorch
+=========================================================
 Detects text regions in images using CRAFT (Character Region Awareness for Text)
 Outputs tight bounding boxes with cropped images as base64.
 
@@ -10,70 +10,120 @@ Usage:
 """
 
 import os
+import sys
 import json
 import base64
 import argparse
 from io import BytesIO
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 import cv2
 import numpy as np
 from PIL import Image
 
-# CRAFT detector
-from craft_text_detector import Craft
+# Add CRAFT-pytorch to path
+CRAFT_DIR = Path(__file__).parent / "CRAFT-pytorch"
+sys.path.insert(0, str(CRAFT_DIR))
+
+import torch
+import torch.backends.cudnn as cudnn
+from torch.autograd import Variable
+
+# Import CRAFT modules
+from craft import CRAFT
+from craft_utils import getDetBoxes, adjustResultCoordinates
+from imgproc import resize_aspect_ratio, normalizeMeanVariance
 
 
 class CraftTextDetector:
     """
-    Text detector using CRAFT model.
+    Text detector using official CRAFT model.
     Provides tight bounding boxes and base64 cropped images.
     """
     
     def __init__(
         self,
+        model_path: str = None,
         text_threshold: float = 0.7,
         link_threshold: float = 0.4,
         low_text: float = 0.4,
         cuda: bool = False,
-        long_size: int = 1280
+        canvas_size: int = 1280,
+        mag_ratio: float = 1.5,
+        poly: bool = False,
+        padding_percentage: float = 0.035,
+        merge_lines: bool = False
     ):
         """
         Initialize CRAFT detector.
         
         Args:
+            model_path: Path to pretrained model
             text_threshold: Text confidence threshold
             link_threshold: Link confidence threshold  
             low_text: Low text score threshold
             cuda: Use GPU if available
-            long_size: Maximum image dimension for processing
+            canvas_size: Maximum canvas size for processing
+            mag_ratio: Image magnification ratio
+            poly: Use polygon output
+            padding_percentage: Percentage of width/height to add as padding (default 0.035 = 3.5%)
+            merge_lines: Whether to merge close words into single lines
         """
         self.text_threshold = text_threshold
         self.link_threshold = link_threshold
         self.low_text = low_text
-        self.cuda = cuda
-        self.long_size = long_size
-        self.craft = None
+        self.cuda = cuda and torch.cuda.is_available()
+        self.canvas_size = canvas_size
+        self.mag_ratio = mag_ratio
+        self.poly = poly
+        self.padding_percentage = padding_percentage
+        self.merge_lines = merge_lines
         
-    def _init_model(self):
-        """Initialize CRAFT model (lazy loading)."""
-        if self.craft is None:
+        # Default model path
+        if model_path is None:
+            model_path = str(CRAFT_DIR / "craft_mlt_25k.pth")
+        self.model_path = model_path
+        
+        self.net = None
+        
+    def _load_model(self):
+        """Load CRAFT model."""
+        if self.net is None:
             print("Loading CRAFT model...")
-            self.craft = Craft(
-                output_dir=None,  # Don't save intermediate files
-                crop_type="poly",
-                cuda=self.cuda,
-                text_threshold=self.text_threshold,
-                link_threshold=self.link_threshold,
-                low_text=self.low_text,
-                long_size=self.long_size
-            )
+            self.net = CRAFT()
+            
+            print(f"Loading weights from: {self.model_path}")
+            
+            # Load state dict
+            if self.cuda:
+                state_dict = torch.load(self.model_path)
+            else:
+                state_dict = torch.load(self.model_path, map_location='cpu')
+            
+            # Handle DataParallel saved weights (remove 'module.' prefix)
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    name = k[7:]  # remove 'module.' prefix
+                else:
+                    name = k
+                new_state_dict[name] = v
+            
+            self.net.load_state_dict(new_state_dict)
+            
+            if self.cuda:
+                self.net = self.net.cuda()
+                self.net = torch.nn.DataParallel(self.net)
+                cudnn.benchmark = False
+            
+            self.net.eval()
             print("CRAFT model loaded successfully!")
     
     def _crop_polygon(self, image: np.ndarray, polygon: np.ndarray) -> np.ndarray:
         """
-        Crop image using polygon coordinates with tight bounding box.
+        Crop image using polygon coordinates with tight bounding box + padding.
         
         Args:
             image: Original image (BGR)
@@ -82,14 +132,27 @@ class CraftTextDetector:
         Returns:
             Cropped image as numpy array
         """
-        # Get tight bounding box from polygon
+        # Get raw coordinates
         x_coords = polygon[:, 0]
         y_coords = polygon[:, 1]
         
-        x_min = max(0, int(np.floor(x_coords.min())))
-        x_max = min(image.shape[1], int(np.ceil(x_coords.max())))
-        y_min = max(0, int(np.floor(y_coords.min())))
-        y_max = min(image.shape[0], int(np.ceil(y_coords.max())))
+        # Calculate dynamic padding
+        w = x_coords.max() - x_coords.min()
+        h = y_coords.max() - y_coords.min()
+        
+        pad_x = w * self.padding_percentage
+        pad_y = h * self.padding_percentage
+        
+        x_min = int(np.floor(x_coords.min() - pad_x))
+        x_max = int(np.ceil(x_coords.max() + pad_x))
+        y_min = int(np.floor(y_coords.min() - pad_y))
+        y_max = int(np.ceil(y_coords.max() + pad_y))
+        
+        # Clamp to image boundaries
+        x_min = max(0, x_min)
+        x_max = min(image.shape[1], x_max)
+        y_min = max(0, y_min)
+        y_max = min(image.shape[0], y_max)
         
         # Crop the region
         cropped = image[y_min:y_max, x_min:x_max]
@@ -132,7 +195,7 @@ class CraftTextDetector:
     
     def _polygon_to_bbox(self, polygon: np.ndarray) -> Dict[str, int]:
         """
-        Convert polygon to axis-aligned bounding box.
+        Convert polygon to axis-aligned bounding box with padding.
         
         Args:
             polygon: 4-point polygon
@@ -143,10 +206,25 @@ class CraftTextDetector:
         x_coords = polygon[:, 0]
         y_coords = polygon[:, 1]
         
-        x = int(np.floor(x_coords.min()))
-        y = int(np.floor(y_coords.min()))
-        width = int(np.ceil(x_coords.max() - x_coords.min()))
-        height = int(np.ceil(y_coords.max() - y_coords.min()))
+        # Calculate dynamic padding
+        w = x_coords.max() - x_coords.min()
+        h = y_coords.max() - y_coords.min()
+        
+        pad_x = w * self.padding_percentage
+        pad_y = h * self.padding_percentage
+        
+        x_min = int(np.floor(x_coords.min() - pad_x))
+        x_max = int(np.ceil(x_coords.max() + pad_x))
+        y_min = int(np.floor(y_coords.min() - pad_y))
+        y_max = int(np.ceil(y_coords.max() + pad_y))
+
+        
+        # Don't clamp here, or do we? Usually bbox can handle being slightly out if not used for cropping directly
+        # But for consistency, let's keep it clean
+        x = x_min
+        y = y_min
+        width = x_max - x_min
+        height = y_max - y_min
         
         return {
             "x": x,
@@ -154,6 +232,145 @@ class CraftTextDetector:
             "width": width,
             "height": height
         }
+
+    def _merge_close_regions(self, polys: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        Merge close polygons that are likely on the same line.
+        """
+        if not polys or len(polys) == 0:
+            return []
+            
+        # 1. Convert to detailed objects
+        regions = []
+        for p in polys:
+            if p is None: continue
+            xs, ys = p[:, 0], p[:, 1]
+            regions.append({
+                "poly": p,
+                "x1": xs.min(), "x2": xs.max(),
+                "y1": ys.min(), "y2": ys.max(),
+                "cy": (ys.min() + ys.max()) / 2,
+                "height": ys.max() - ys.min()
+            })
+        
+        if not regions:
+            return []
+            
+        # 2. Group by lines (simple Y clustering)
+        regions.sort(key=lambda r: r["cy"])
+        lines = []
+        current_line = [regions[0]]
+        
+        for r in regions[1:]:
+            # Compare with average cy of current line
+            avg_cy = sum(item["cy"] for item in current_line) / len(current_line)
+            
+            # Use max height of current line as reference
+            avg_h = sum(item["height"] for item in current_line) / len(current_line)
+            
+            # If cy diff is small relative to height (0.5 * h)
+            if abs(r["cy"] - avg_cy) < (0.5 * avg_h):
+                current_line.append(r)
+            else:
+                lines.append(current_line)
+                current_line = [r]
+        lines.append(current_line)
+        
+        # 3. Merge within lines
+        final_polys = []
+        
+        for line in lines:
+            # Sort by x1 (left to right)
+            line.sort(key=lambda r: r["x1"])
+            
+            merged_line = [line[0]]
+            for r in line[1:]:
+                prev = merged_line[-1]
+                
+                # Horizontal gap check
+                # Limit gap to 1.5 * max height of the pair
+                max_h = max(prev["height"], r["height"])
+                gap = r["x1"] - prev["x2"]
+                
+                if gap < (1.5 * max_h): 
+                    # Merge them
+                    new_x1 = min(prev["x1"], r["x1"])
+                    new_x2 = max(prev["x2"], r["x2"])
+                    new_y1 = min(prev["y1"], r["y1"])
+                    new_y2 = max(prev["y2"], r["y2"])
+                    
+                    # Create simple rect poly for merged region
+                    new_poly = np.array([
+                        [new_x1, new_y1], [new_x2, new_y1],
+                        [new_x2, new_y2], [new_x1, new_y2]
+                    ], dtype=np.float32)
+                    
+                    # Update prev (the last item in merged_line)
+                    merged_line[-1] = {
+                        "poly": new_poly,
+                        "x1": new_x1, "x2": new_x2,
+                        "y1": new_y1, "y2": new_y2,
+                        "cy": (new_y1 + new_y2) / 2,
+                        "height": new_y2 - new_y1
+                    }
+                else:
+                    merged_line.append(r)
+            
+            final_polys.extend([m["poly"] for m in merged_line])
+            
+        return final_polys
+    
+    def _run_craft(self, image: np.ndarray):
+        """
+        Run CRAFT detection on image.
+        
+        Args:
+            image: Image as numpy array (RGB)
+            
+        Returns:
+            boxes, polys, score_text
+        """
+        # Resize
+        img_resized, target_ratio, size_heatmap = resize_aspect_ratio(
+            image, self.canvas_size, interpolation=cv2.INTER_LINEAR, mag_ratio=self.mag_ratio
+        )
+        ratio_h = ratio_w = 1 / target_ratio
+        
+        # Preprocessing
+        x = normalizeMeanVariance(img_resized)
+        x = torch.from_numpy(x).permute(2, 0, 1)  # [h, w, c] to [c, h, w]
+        x = Variable(x.unsqueeze(0))  # [c, h, w] to [b, c, h, w]
+        
+        if self.cuda:
+            x = x.cuda()
+        
+        # Forward pass
+        with torch.no_grad():
+            y, feature = self.net(x)
+        
+        # Make score and link map
+        score_text = y[0, :, :, 0].cpu().data.numpy()
+        score_link = y[0, :, :, 1].cpu().data.numpy()
+        
+        # Post-processing
+        boxes, polys = getDetBoxes(
+            score_text, score_link, 
+            self.text_threshold, self.link_threshold, self.low_text, self.poly
+        )
+        
+        # Coordinate adjustment
+        boxes = adjustResultCoordinates(boxes, ratio_w, ratio_h)
+        # Handle polys adjustment manually to avoid numpy ragged array errors
+        for k in range(len(polys)):
+            if polys[k] is not None:
+                polys[k] = np.array(polys[k])
+                polys[k] *= (ratio_w * 2, ratio_h * 2)  # ratio_net is 2 by default
+        
+        for k in range(len(polys)):
+            if polys[k] is None:
+                polys[k] = boxes[k]
+        
+        return boxes, polys, score_text
     
     def detect(self, image_path: str) -> Dict[str, Any]:
         """
@@ -165,8 +382,8 @@ class CraftTextDetector:
         Returns:
             Dict with image info and detected text regions
         """
-        # Initialize model if not done
-        self._init_model()
+        # Load model if not loaded
+        self._load_model()
         
         # Load image
         image_path = Path(image_path)
@@ -179,17 +396,22 @@ class CraftTextDetector:
         
         height, width = image.shape[:2]
         
+        # Convert to RGB for CRAFT
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
         # Run CRAFT detection
         print(f"Processing: {image_path.name}")
-        prediction_result = self.craft.detect_text(str(image_path))
+        boxes, polys, _ = self._run_craft(image_rgb)
         
-        # Extract polygons (boxes)
-        boxes = prediction_result["boxes"]
+        # Merge if requested
+        if self.merge_lines:
+            print("Merging close regions (line mode)...")
+            polys = self._merge_close_regions(polys)
         
         # Process each detected region
         text_regions = []
-        for idx, polygon in enumerate(boxes):
-            polygon = np.array(polygon, dtype=np.float32)
+        for idx, poly in enumerate(polys):
+            polygon = np.array(poly, dtype=np.float32)
             
             # Get bounding box
             bbox = self._polygon_to_bbox(polygon)
@@ -373,6 +595,17 @@ def main():
         default=0.4,
         help="Link confidence threshold (0-1)"
     )
+    parser.add_argument(
+        "--padding-percentage", 
+        type=float, 
+        default=0.035,
+        help="Padding percentage (default 0.035 = 3.5%)"
+    )
+    parser.add_argument(
+        "--merge-lines", 
+        action="store_true",
+        help="Merge close words into single lines"
+    )
     
     args = parser.parse_args()
     
@@ -383,7 +616,9 @@ def main():
     detector = CraftTextDetector(
         text_threshold=args.text_threshold,
         link_threshold=args.link_threshold,
-        cuda=args.cuda
+        cuda=args.cuda,
+        padding_percentage=args.padding_percentage,
+        merge_lines=args.merge_lines
     )
     
     # Process single image or batch
